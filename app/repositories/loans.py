@@ -43,7 +43,7 @@ class LoanRepository(Repository[Loan]):
             clauses.append(Loan.book_id == book_id)
         return clauses
 
-    async def list(
+    async def fetch_page(
         self,
         *,
         status: LoanStatus | None = None,

@@ -21,7 +21,9 @@ async def list_members(
     offset: int = 0,
     limit: int = 20,
 ) -> tuple[list[Member], int]:
-    return await MemberRepository(session).list(q=q, status=status, offset=offset, limit=limit)
+    return await MemberRepository(session).fetch_page(
+        q=q, status=status, offset=offset, limit=limit
+    )
 
 
 async def get_member(session: AsyncSession, member_id: int) -> Member:

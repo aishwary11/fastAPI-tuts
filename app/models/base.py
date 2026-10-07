@@ -19,13 +19,20 @@ NAMING_CONVENTION = {
 
 
 class Base(DeclarativeBase):
-    """Base class for every ORM model."""
+    """Base class for every ORM model.
+
+    The surrogate integer primary key is declared once here -- every table uses
+    it. Declaring it on the base (rather than repeating it per model) is also
+    what lets ``Repository[ModelT]`` address rows via ``Model.id`` without a
+    cast, since ``ModelT`` is bounded by this class.
+    """
 
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
 
+    id: Mapped[int] = mapped_column(primary_key=True)
+
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        pk = getattr(self, "id", None)
-        return f"<{type(self).__name__} id={pk}>"
+        return f"<{type(self).__name__} id={self.id}>"
 
 
 class TimestampMixin:

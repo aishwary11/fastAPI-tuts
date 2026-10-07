@@ -35,7 +35,7 @@ async def list_loans(
     offset: int = 0,
     limit: int = 20,
 ) -> tuple[list[Loan], int]:
-    return await LoanRepository(session).list(
+    return await LoanRepository(session).fetch_page(
         status=status,
         member_id=member_id,
         book_id=book_id,

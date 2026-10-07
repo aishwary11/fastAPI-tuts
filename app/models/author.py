@@ -17,7 +17,6 @@ class Author(TimestampMixin, Base):
     __tablename__ = "authors"
     __table_args__ = (Index("ix_authors_name", "name"),)
 
-    id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(160), nullable=False)
     bio: Mapped[str | None] = mapped_column(Text, nullable=True)
     country: Mapped[str | None] = mapped_column(String(80), nullable=True)

@@ -8,7 +8,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from app import __version__
@@ -17,7 +19,7 @@ from app.config import settings
 from app.database import dispose_engine
 from app.exceptions import DomainError
 from app.middleware import RequestContextMiddleware, build_cors_options, current_request_id
-from app.rate_limit import RateLimitMiddleware, SlidingWindowRateLimiter
+from app.rate_limit import build_limiter, install_rate_limiting
 
 logger = logging.getLogger("library")
 
@@ -29,18 +31,6 @@ A small library management API.
 * **Circulation** -- borrow, return and renew books; duplicate active loans are
   rejected and availability is enforced inside a database transaction.
 """
-
-# Endpoints excluded from rate limiting: the health probe and the docs surface.
-UNMETERED_PATHS = frozenset(
-    {
-        "/",
-        "/docs",
-        "/docs/oauth2-redirect",
-        "/redoc",
-        f"{settings.api_v1_prefix}/health",
-        f"{settings.api_v1_prefix}/openapi.json",
-    }
-)
 
 
 @asynccontextmanager
@@ -77,6 +67,24 @@ def register_exception_handlers(app: FastAPI) -> None:
             },
         )
 
+    @app.exception_handler(RateLimitExceeded)
+    async def _rate_limited(request: Request, exc: RateLimitExceeded) -> Response:
+        """Throttled request, in this API's usual error envelope.
+
+        slowapi would otherwise return ``{"error": ...}``; keeping ``detail`` and
+        ``code`` consistent means clients parse one shape for every failure.
+        """
+        response = JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={
+                "detail": f"Rate limit exceeded: {exc.detail}",
+                "code": "rate_limited",
+                "request_id": current_request_id(),
+            },
+        )
+        # Let slowapi attach Retry-After / X-RateLimit-* for this limit.
+        return request.app.state.limiter._inject_headers(response, request.state.view_rate_limit)
+
     @app.exception_handler(SQLAlchemyError)
     async def _database_error(_: Request, exc: SQLAlchemyError) -> JSONResponse:
         logger.exception("Database error: %s", exc)
@@ -90,7 +98,12 @@ def register_exception_handlers(app: FastAPI) -> None:
         )
 
 
-def create_app() -> FastAPI:
+def create_app(*, limiter: Limiter | None = None) -> FastAPI:
+    """Build the application.
+
+    ``limiter`` is an injection seam for tests, which need a tiny budget to
+    exercise throttling without making dozens of requests.
+    """
     app = FastAPI(
         title=settings.app_name,
         version=__version__,
@@ -100,17 +113,12 @@ def create_app() -> FastAPI:
         docs_url="/docs",
         redoc_url="/redoc",
     )
+    register_exception_handlers(app)
 
     # Middleware is applied innermost-first: the last one added ends up
-    # outermost, so request context wraps rate limiting and CORS.
+    # outermost, so request context wraps rate limiting wraps CORS.
     app.add_middleware(CORSMiddleware, **build_cors_options(settings.cors_allow_origins))
 
-    limiter = SlidingWindowRateLimiter()
-    app.state.rate_limiter = limiter
-    app.add_middleware(RateLimitMiddleware, limiter=limiter, exempt_paths=UNMETERED_PATHS)
-    app.add_middleware(RequestContextMiddleware)
-
-    register_exception_handlers(app)
     app.include_router(api_router, prefix=settings.api_v1_prefix)
 
     @app.get("/", tags=["system"], summary="Service banner")
@@ -121,6 +129,12 @@ def create_app() -> FastAPI:
             "docs": "/docs",
             "api": settings.api_v1_prefix,
         }
+
+    # Rate limiting is installed last-but-one: it needs the routes to exist so
+    # the unmetered paths can be exempted, and must sit inside the request
+    # context so a 429 still carries a request id.
+    install_rate_limiting(app, limiter or build_limiter())
+    app.add_middleware(RequestContextMiddleware)
 
     return app
 

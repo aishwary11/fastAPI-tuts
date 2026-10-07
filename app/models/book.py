@@ -26,7 +26,6 @@ class Book(TimestampMixin, Base):
         Index("ix_books_author_id", "author_id"),
     )
 
-    id: Mapped[int] = mapped_column(primary_key=True)
     title: Mapped[str] = mapped_column(String(300), nullable=False)
     isbn: Mapped[str | None] = mapped_column(String(20), unique=True, nullable=True)
     genre: Mapped[str | None] = mapped_column(String(80), nullable=True)

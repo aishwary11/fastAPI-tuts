@@ -2,11 +2,32 @@
 
 from __future__ import annotations
 
-import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+import httpx
+from fastapi import FastAPI
 
 from app.config import settings
-from app.main import app
+from app.main import create_app
+from app.rate_limit import build_limiter
 from tests.conftest import API
+
+
+@asynccontextmanager
+async def client_for(target: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    transport = httpx.ASGITransport(app=target)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http_client:
+        yield http_client
+
+
+def app_with_budget(limit: str = "3/minute", **overrides: object) -> FastAPI:
+    """A separate app whose limiter uses `limit` instead of the suite's budget."""
+    config = settings.model_copy(
+        update={"rate_limit_default": limit, "rate_limit_storage_uri": "memory://"} | overrides
+    )
+    return create_app(limiter=build_limiter(config))
+
 
 # --- request context --------------------------------------------------------
 
@@ -58,76 +79,72 @@ async def test_cors_preflight_is_allowed(client):
 # --- rate limiting ----------------------------------------------------------
 
 
-async def test_successful_responses_advertise_the_budget(client):
-    response = await client.get(f"{API}/stats")
-    assert response.headers["x-ratelimit-limit"] == str(settings.rate_limit_requests)
-    assert int(response.headers["x-ratelimit-remaining"]) == settings.rate_limit_requests - 1
+async def test_requests_within_budget_pass(client):
+    async with client_for(app_with_budget("3/minute")) as http_client:
+        codes = [(await http_client.get(f"{API}/stats")).status_code for _ in range(3)]
+    assert codes == [200, 200, 200]
 
 
-async def test_rate_limit_allows_ten_requests_then_returns_429(client, monkeypatch):
-    """The advertised 10-per-minute budget, driven through the real ASGI app."""
-    monkeypatch.setattr(settings, "rate_limit_requests", 10)
-    monkeypatch.setattr(settings, "rate_limit_window_seconds", 60)
-    app.state.rate_limiter.reset()
+async def test_request_over_budget_is_rejected(client):
+    async with client_for(app_with_budget("3/minute")) as http_client:
+        for _ in range(3):
+            assert (await http_client.get(f"{API}/stats")).status_code == 200
+        blocked = await http_client.get(f"{API}/stats")
 
-    for attempt in range(1, 11):
-        response = await client.get(f"{API}/stats")
-        assert response.status_code == 200, f"request {attempt} should be allowed"
-
-    blocked = await client.get(f"{API}/stats")
     assert blocked.status_code == 429
     body = blocked.json()
     assert body["code"] == "rate_limited"
     assert "Rate limit exceeded" in body["detail"]
-    assert int(blocked.headers["retry-after"]) >= 1
-    assert blocked.headers["x-ratelimit-remaining"] == "0"
     # The rejection still passed through the request-context middleware.
-    assert blocked.headers["x-request-id"]
+    assert body["request_id"] == blocked.headers["x-request-id"]
+    assert int(blocked.headers["retry-after"]) >= 1
+    assert blocked.headers["x-ratelimit-limit"] == "3"
+    assert blocked.headers["x-ratelimit-remaining"] == "0"
 
 
-async def test_rate_limit_window_recovers(client, monkeypatch):
-    monkeypatch.setattr(settings, "rate_limit_requests", 1)
-    monkeypatch.setattr(settings, "rate_limit_window_seconds", 1)
-    app.state.rate_limiter.reset()
-
-    assert (await client.get(f"{API}/stats")).status_code == 200
-    assert (await client.get(f"{API}/stats")).status_code == 429
-
-    await asyncio.sleep(1.1)
-    assert (await client.get(f"{API}/stats")).status_code == 200
+async def test_budget_is_shared_across_endpoints(client):
+    """One budget per client, not one per path."""
+    async with client_for(app_with_budget("3/minute")) as http_client:
+        for _ in range(3):
+            assert (await http_client.get(f"{API}/stats")).status_code == 200
+        # A different endpoint must not hand out a fresh budget.
+        other = await http_client.get(f"{API}/books")
+    assert other.status_code == 429
 
 
-async def test_health_probe_is_exempt_from_rate_limiting(client, monkeypatch):
-    monkeypatch.setattr(settings, "rate_limit_requests", 1)
-    app.state.rate_limiter.reset()
-
-    for _ in range(5):
-        assert (await client.get(f"{API}/health")).status_code == 200
+async def test_health_probe_is_exempt_from_rate_limiting(client):
+    async with client_for(app_with_budget("1/minute")) as http_client:
+        codes = [(await http_client.get(f"{API}/health")).status_code for _ in range(5)]
+    assert codes == [200] * 5
 
 
-async def test_rate_limiting_can_be_disabled(client, monkeypatch):
-    monkeypatch.setattr(settings, "rate_limit_requests", 1)
-    monkeypatch.setattr(settings, "rate_limit_enabled", False)
-    app.state.rate_limiter.reset()
-
-    for _ in range(5):
-        assert (await client.get(f"{API}/stats")).status_code == 200
+async def test_docs_are_exempt_from_rate_limiting(client):
+    async with client_for(app_with_budget("1/minute")) as http_client:
+        codes = [(await http_client.get("/docs")).status_code for _ in range(3)]
+    assert codes == [200, 200, 200]
 
 
-async def test_forwarded_for_is_only_trusted_when_configured(client, monkeypatch):
-    monkeypatch.setattr(settings, "rate_limit_requests", 1)
-    app.state.rate_limiter.reset()
+async def test_rate_limiting_can_be_disabled():
+    app = app_with_budget("1/minute", rate_limit_enabled=False)
+    async with client_for(app) as http_client:
+        codes = [(await http_client.get(f"{API}/stats")).status_code for _ in range(5)]
+    assert codes == [200] * 5
 
-    # Spoofing the header must not grant a fresh budget by default.
-    first = await client.get(f"{API}/stats", headers={"X-Forwarded-For": "1.2.3.4"})
-    second = await client.get(f"{API}/stats", headers={"X-Forwarded-For": "5.6.7.8"})
+
+async def test_forwarded_for_is_only_trusted_when_configured(monkeypatch):
+    """Spoofing X-Forwarded-For must not grant a fresh budget by default."""
+    app = app_with_budget("1/minute")
+    async with client_for(app) as http_client:
+        first = await http_client.get(f"{API}/stats", headers={"X-Forwarded-For": "1.2.3.4"})
+        second = await http_client.get(f"{API}/stats", headers={"X-Forwarded-For": "5.6.7.8"})
     assert first.status_code == 200
     assert second.status_code == 429
 
     # Opting in behind a trusted proxy makes the header meaningful.
     monkeypatch.setattr(settings, "trust_proxy_headers", True)
-    app.state.rate_limiter.reset()
-    allowed = await client.get(f"{API}/stats", headers={"X-Forwarded-For": "1.2.3.4"})
-    other_client = await client.get(f"{API}/stats", headers={"X-Forwarded-For": "5.6.7.8"})
-    assert allowed.status_code == 200
-    assert other_client.status_code == 200
+    app = app_with_budget("1/minute")
+    async with client_for(app) as http_client:
+        a = await http_client.get(f"{API}/stats", headers={"X-Forwarded-For": "1.2.3.4"})
+        b = await http_client.get(f"{API}/stats", headers={"X-Forwarded-For": "5.6.7.8"})
+    assert a.status_code == 200
+    assert b.status_code == 200

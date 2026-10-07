@@ -1,183 +1,164 @@
-"""Per-client rate limiting.
+"""Rate limiting, delegated to `slowapi` (which builds on the `limits` library).
 
-Implemented as raw ASGI middleware. Requests are counted in a sliding-window log
-keyed by the client's address; the first request over the limit is rejected with
-``429`` and a ``Retry-After`` hint.
+Why a library rather than hand-rolled counters:
 
-.. warning::
-   The counters live in this process's memory. Running several workers (or
-   several containers) multiplies the effective limit, because each worker keeps
-   its own window. For a hard global limit, back the limiter with Redis.
+* keeping **one shared budget across workers** is a storage problem, not a
+  middleware problem -- `limits` already ships the atomic Redis algorithms, and
+  switching ``RATE_LIMIT_STORAGE_URI`` from ``memory://`` to ``redis://`` is the
+  whole change;
+* ``in_memory_fallback`` keeps a limit enforced from process memory while the
+  shared store is unreachable, instead of silently failing open.
+
+Why there is still a small middleware here: slowapi's own middleware finds the
+route handler by walking ``app.routes`` looking for ``route.endpoint``. FastAPI
+0.142 represents included routers as lazy ``_IncludedRouter`` objects that expose
+no ``endpoint`` (and no ``routes``), so that lookup returns ``None`` and slowapi
+treats **every request as exempt** -- it fails open, silently. Rather than patch
+around a private lookup, this middleware resolves the request itself and calls
+the limiter directly; all counting, storage, fallback and header logic is still
+the library's.
 """
 
 from __future__ import annotations
 
-import math
-import threading
-import time
-from collections import deque
-from collections.abc import Collection
-from dataclasses import dataclass
+import inspect
+from collections.abc import Awaitable, Callable
+from typing import Any
 
+from fastapi import FastAPI, Request
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 from starlette.datastructures import MutableHeaders
-from starlette.responses import JSONResponse
+from starlette.responses import Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from app.config import settings
+from app.config import Settings, settings
 
-DEFAULT_MAX_TRACKED_CLIENTS = 10_000
+MEMORY_STORAGE_PREFIX = "memory://"
 
-RATE_LIMIT_LIMIT_HEADER = "X-RateLimit-Limit"
-RATE_LIMIT_REMAINING_HEADER = "X-RateLimit-Remaining"
-RATE_LIMIT_RESET_HEADER = "X-RateLimit-Reset"
+ExceededHandler = Callable[[Request, RateLimitExceeded], "Response | Awaitable[Response]"]
 
 
-@dataclass(frozen=True, slots=True)
-class RateLimitResult:
-    """Outcome of a single rate-limit check."""
+def client_identifier(request: Request) -> str:
+    """Identify the caller for rate-limiting purposes.
 
-    allowed: bool
-    limit: int
-    remaining: int
-    reset_after: float
-    retry_after: float
-
-
-class SlidingWindowRateLimiter:
-    """Sliding-window log limiter backed by an in-process dict.
-
-    A sliding window is used rather than a fixed one so a client cannot burst
-    twice the limit by straddling a window boundary.
+    ``X-Forwarded-For`` is only consulted when ``TRUST_PROXY_HEADERS`` is on,
+    because otherwise any client could present a fresh identity per request and
+    never be limited.
     """
+    from slowapi.util import get_remote_address
 
-    def __init__(self, max_tracked_clients: int = DEFAULT_MAX_TRACKED_CLIENTS) -> None:
-        self._hits: dict[str, deque[float]] = {}
-        self._lock = threading.Lock()
-        self.max_tracked_clients = max_tracked_clients
+    if settings.trust_proxy_headers:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            first_hop = forwarded.split(",")[0].strip()
+            if first_hop:
+                return first_hop
+    return get_remote_address(request)
 
-    def check(
-        self,
-        key: str,
-        *,
-        limit: int,
-        window: float,
-        now: float | None = None,
-    ) -> RateLimitResult:
-        moment = time.monotonic() if now is None else now
-        cutoff = moment - window
 
-        with self._lock:
-            bucket = self._hits.setdefault(key, deque())
-            while bucket and bucket[0] <= cutoff:
-                bucket.popleft()
+def build_limiter(config: Settings | None = None) -> Limiter:
+    """Create a limiter from configuration."""
+    config = config or settings
+    shared_store = not config.rate_limit_storage_uri.startswith(MEMORY_STORAGE_PREFIX)
+    return Limiter(
+        key_func=client_identifier,
+        # application_limits give one budget per client across the whole API.
+        # (default_limits would key the budget per path, so a client could still
+        # make 10 requests to each of the 16 endpoints.)
+        application_limits=[config.rate_limit_default],
+        storage_uri=config.rate_limit_storage_uri,
+        # If the shared store goes down, keep enforcing the same budget from
+        # process memory rather than letting every request through.
+        in_memory_fallback=[config.rate_limit_default],
+        in_memory_fallback_enabled=shared_store,
+        # Emit X-RateLimit-* / Retry-After so clients can see their budget.
+        headers_enabled=True,
+        enabled=config.rate_limit_enabled,
+    )
 
-            if len(bucket) >= limit:
-                # The oldest hit is what frees the next slot.
-                retry_after = max(bucket[0] - cutoff, 0.0)
-                return RateLimitResult(False, limit, 0, window, retry_after)
 
-            bucket.append(moment)
-            self._evict_stale(cutoff)
-            return RateLimitResult(True, limit, limit - len(bucket), window, 0.0)
+def unmetered_paths() -> frozenset[str]:
+    """Paths that stay reachable no matter how busy a client is.
 
-    def _evict_stale(self, cutoff: float) -> None:
-        """Keep the dict bounded when many distinct clients appear."""
-        if len(self._hits) <= self.max_tracked_clients:
-            return
-        for key in [key for key, hits in self._hits.items() if not hits or hits[-1] <= cutoff]:
-            del self._hits[key]
-
-    def reset(self) -> None:
-        """Forget every window (used by tests)."""
-        with self._lock:
-            self._hits.clear()
+    The health probe drives monitoring and the docs surface is how humans
+    explore the API; throttling either is a footgun.
+    """
+    return frozenset(
+        {
+            "/",
+            "/docs",
+            "/docs/oauth2-redirect",
+            "/redoc",
+            f"{settings.api_v1_prefix}/openapi.json",
+            f"{settings.api_v1_prefix}/health",
+        }
+    )
 
 
 class RateLimitMiddleware:
-    """Reject requests once a client exceeds the configured budget."""
+    """Evaluate the limiter for every metered request."""
 
     def __init__(
         self,
         app: ASGIApp,
         *,
-        limiter: SlidingWindowRateLimiter | None = None,
-        exempt_paths: Collection[str] = (),
+        limiter: Limiter,
+        unmetered: frozenset[str] | None = None,
+        handler: ExceededHandler = _rate_limit_exceeded_handler,
     ) -> None:
         self.app = app
-        self.limiter = limiter or SlidingWindowRateLimiter()
-        self.exempt_paths = frozenset(exempt_paths)
+        self.limiter = limiter
+        self.unmetered = unmetered if unmetered is not None else unmetered_paths()
+        self.handler = handler
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or not settings.rate_limit_enabled:
+        if scope["type"] != "http" or scope.get("path") in self.unmetered:
             await self.app(scope, receive, send)
             return
 
-        # Preflight requests are exempt so browsers can negotiate CORS.
-        if scope.get("method") == "OPTIONS" or scope.get("path") in self.exempt_paths:
-            await self.app(scope, receive, send)
-            return
-
-        result = self.limiter.check(
-            self._client_key(scope),
-            limit=settings.rate_limit_requests,
-            window=settings.rate_limit_window_seconds,
-        )
-
-        if not result.allowed:
-            retry_after = max(1, math.ceil(result.retry_after))
-            response = JSONResponse(
-                status_code=429,
-                content={
-                    "detail": (
-                        f"Rate limit exceeded: {result.limit} requests per "
-                        f"{int(settings.rate_limit_window_seconds)}s. "
-                        f"Retry in {retry_after}s."
-                    ),
-                    "code": "rate_limited",
-                },
-                headers=self._headers(result, retry_after=retry_after),
-            )
+        request = Request(scope, receive=receive)
+        try:
+            # Passing no endpoint means the URL is used as the limit key and the
+            # configured default limits apply.
+            self.limiter._check_request_limit(request, None, True)
+        except RateLimitExceeded as exc:
+            # Raised inside the middleware, so Starlette's exception middleware
+            # (which sits further in) never sees it -- invoke the handler here.
+            response = self.handler(request, exc)
+            if inspect.isawaitable(response):
+                response = await response
             await response(scope, receive, send)
             return
 
+        current_limit: Any | None = getattr(request.state, "view_rate_limit", None)
+
         async def send_with_budget(message: Message) -> None:
-            if message["type"] == "http.response.start":
-                MutableHeaders(scope=message).update(self._headers(result))
+            if message["type"] == "http.response.start" and current_limit is not None:
+                # MutableHeaders mutates the raw header list in place, which is
+                # what slowapi's header injection expects.
+                headers = MutableHeaders(raw=message["headers"])
+                self.limiter._inject_asgi_headers(headers, current_limit)
             await send(message)
 
         await self.app(scope, receive, send_with_budget)
 
-    @staticmethod
-    def _headers(result: RateLimitResult, retry_after: int | None = None) -> dict[str, str]:
-        headers = {
-            RATE_LIMIT_LIMIT_HEADER: str(result.limit),
-            RATE_LIMIT_REMAINING_HEADER: str(result.remaining),
-            RATE_LIMIT_RESET_HEADER: str(int(result.reset_after)),
-        }
-        if retry_after is not None:
-            headers["Retry-After"] = str(retry_after)
-        return headers
 
-    @staticmethod
-    def _client_key(scope: Scope) -> str:
-        """Identify the caller.
-
-        ``X-Forwarded-For`` is only consulted when ``TRUST_PROXY_HEADERS`` is on,
-        because otherwise any client could spoof its identity and bypass the
-        limit entirely.
-        """
-        if settings.trust_proxy_headers:
-            for name, value in scope.get("headers", []):
-                if name == b"x-forwarded-for":
-                    first_hop = value.decode("latin-1").split(",")[0].strip()
-                    if first_hop:
-                        return first_hop
-        client = scope.get("client")
-        return client[0] if client else "unknown"
+def install_rate_limiting(app: FastAPI, limiter: Limiter) -> None:
+    """Attach the limiter and its middleware to an app."""
+    app.state.limiter = limiter
+    app.add_middleware(
+        RateLimitMiddleware,
+        limiter=limiter,
+        unmetered=unmetered_paths(),
+        handler=app.exception_handlers.get(RateLimitExceeded, _rate_limit_exceeded_handler),
+    )
 
 
 __all__ = [
     "RateLimitMiddleware",
-    "RateLimitResult",
-    "SlidingWindowRateLimiter",
+    "build_limiter",
+    "client_identifier",
+    "install_rate_limiting",
+    "unmetered_paths",
 ]

@@ -19,10 +19,8 @@ os.environ["POSTGRES_DB"] = "library_test"
 os.environ["ENVIRONMENT"] = "test"
 os.environ["DB_ECHO"] = "false"
 # The functional suite makes far more than 10 requests per test; the rate
-# limiter gets its own dedicated test that lowers this back to the real default.
-os.environ["RATE_LIMIT_REQUESTS"] = "100000"
-
-from datetime import UTC
+# limiter gets its own dedicated tests that lower this back to a real budget.
+os.environ["RATE_LIMIT_DEFAULT"] = "100000/minute"
 
 import pytest  # noqa: E402
 import pytest_asyncio  # noqa: E402
@@ -61,7 +59,7 @@ async def clean_tables() -> AsyncIterator[None]:
     """Give every test an empty library and a fresh rate-limit window."""
     async with engine.begin() as connection:
         await connection.execute(text(f"TRUNCATE {TRUNCATE_TABLES} RESTART IDENTITY CASCADE"))
-    app.state.rate_limiter.reset()
+    app.state.limiter.reset()
     yield
 
 
@@ -70,6 +68,22 @@ async def client() -> AsyncIterator[AsyncClient]:
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as http_client:
         yield http_client
+
+
+@pytest_asyncio.fixture
+async def age_loan():
+    """Backdate a loan so overdue behaviour can be exercised."""
+    from datetime import UTC, datetime, timedelta
+
+    async def _age(loan_id: int, *, overdue_by_days: int) -> None:
+        due = datetime.now(UTC) - timedelta(days=overdue_by_days)
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("UPDATE loans SET borrowed_at = :borrowed, due_at = :due WHERE id = :id"),
+                {"borrowed": due - timedelta(days=14), "due": due, "id": loan_id},
+            )
+
+    return _age
 
 
 # --------------------------------------------------------------------------
@@ -99,23 +113,6 @@ def make_book(client: AsyncClient, make_author):
         return response.json()
 
     return _make
-
-
-@pytest_asyncio.fixture
-async def age_loan():
-    """Backdate a loan so overdue behaviour can be exercised."""
-    from datetime import datetime, timedelta
-
-    async def _age(loan_id: int, *, overdue_by_days: int) -> None:
-        now = datetime.now(UTC)
-        due = now - timedelta(days=overdue_by_days)
-        async with engine.begin() as connection:
-            await connection.execute(
-                text("UPDATE loans SET borrowed_at = :borrowed, due_at = :due WHERE id = :id"),
-                {"borrowed": due - timedelta(days=14), "due": due, "id": loan_id},
-            )
-
-    return _age
 
 
 @pytest.fixture

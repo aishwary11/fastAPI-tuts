@@ -23,7 +23,7 @@ async def list_books(
     offset: int = 0,
     limit: int = 20,
 ) -> tuple[list[Book], int]:
-    return await BookRepository(session).list(
+    return await BookRepository(session).fetch_page(
         q=q,
         author_id=author_id,
         genre=genre,

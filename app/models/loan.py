@@ -36,8 +36,6 @@ class Loan(TimestampMixin, Base):
         ),
     )
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-
     book_id: Mapped[int] = mapped_column(
         ForeignKey("books.id", ondelete="RESTRICT"), nullable=False
     )

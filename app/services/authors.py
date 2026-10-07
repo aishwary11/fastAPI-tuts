@@ -16,7 +16,7 @@ DUPLICATE_AUTHOR_MSG = "Author details conflict with an existing record"
 async def list_authors(
     session: AsyncSession, *, q: str | None = None, offset: int = 0, limit: int = 20
 ) -> tuple[list[Author], int]:
-    return await AuthorRepository(session).list(q=q, offset=offset, limit=limit)
+    return await AuthorRepository(session).fetch_page(q=q, offset=offset, limit=limit)
 
 
 async def get_author(session: AsyncSession, author_id: int) -> Author:

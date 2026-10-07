@@ -22,7 +22,6 @@ class Member(TimestampMixin, Base):
     __tablename__ = "members"
     __table_args__ = (Index("ix_members_email", "email", unique=True),)
 
-    id: Mapped[int] = mapped_column(primary_key=True)
     full_name: Mapped[str] = mapped_column(String(160), nullable=False)
     email: Mapped[str] = mapped_column(String(255), nullable=False)
     phone: Mapped[str | None] = mapped_column(String(40), nullable=True)

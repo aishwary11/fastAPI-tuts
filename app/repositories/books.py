@@ -37,7 +37,7 @@ class BookRepository(Repository[Book]):
             clauses.append(Book.available_copies > 0)
         return clauses
 
-    async def list(
+    async def fetch_page(
         self,
         *,
         q: str | None = None,

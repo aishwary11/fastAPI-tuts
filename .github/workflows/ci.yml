@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: build & test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the floor declared in pyproject.toml; 3.14 is what the
+        # project is developed against.
+        python-version: ["3.11", "3.14"]
+
+    env:
+      ENVIRONMENT: test
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: library_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # The Ubuntu runner ships PostgreSQL, so no service container is needed.
+      - name: Prepare PostgreSQL
+        run: |
+          sudo systemctl start postgresql.service
+          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
+          sudo -u postgres createdb library
+          sudo -u postgres createdb library_test
+          pg_isready -h localhost -p 5432
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      # `scripts.check` is the same runner developers use locally.
+      - name: Lint and format
+        run: python -m scripts.check lint format
+
+      - name: Type check
+        run: python -m scripts.check typecheck
+
+      # The suite builds its own schema by running the Alembic migrations.
+      - name: Test
+        run: python -m scripts.check test
+
+      - name: Build
+        run: python -m scripts.check build
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributions-py${{ matrix.python-version }}
+          path: dist/
+          if-no-files-found: error

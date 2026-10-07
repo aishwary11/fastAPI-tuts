@@ -21,7 +21,7 @@ class MemberRepository(Repository[Member]):
             clauses.append(Member.status == status)
         return clauses
 
-    async def list(
+    async def fetch_page(
         self,
         *,
         q: str | None = None,

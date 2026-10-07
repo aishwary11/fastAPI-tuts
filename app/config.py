@@ -32,10 +32,13 @@ class Settings(BaseSettings):
     # (which would reject the plain `*`), leaving it to the validator below.
     cors_allow_origins: Annotated[list[str], NoDecode] = ["*"]
 
-    # Rate limiting: 10 requests per client per minute by default.
+    # Rate limiting is delegated to slowapi. `rate_limit_default` uses the
+    # `limits` syntax: "10/minute", "100/hour", "5/second", ...
     rate_limit_enabled: bool = True
-    rate_limit_requests: int = Field(default=10, ge=1)
-    rate_limit_window_seconds: int = Field(default=60, ge=1)
+    rate_limit_default: str = "10/minute"
+    # "memory://" counts per process. Point this at Redis to get one shared
+    # budget across every worker/container, e.g. "redis://localhost:6379/0".
+    rate_limit_storage_uri: str = "memory://"
     # Only enable behind a reverse proxy you control: it makes the limiter trust
     # the client-supplied X-Forwarded-For header.
     trust_proxy_headers: bool = False

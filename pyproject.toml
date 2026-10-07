@@ -12,6 +12,7 @@ dependencies = [
     "alembic>=1.13",
     "pydantic[email]>=2.9",
     "pydantic-settings>=2.5",
+    "slowapi>=0.1.9",
 ]
 
 [project.optional-dependencies]
@@ -20,6 +21,8 @@ dev = [
     "pytest-asyncio>=0.24",
     "httpx>=0.27",
     "ruff>=0.7",
+    "mypy>=1.13",
+    "build>=1.2",
 ]
 
 [build-system]
@@ -37,6 +40,14 @@ asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
 testpaths = ["tests"]
 filterwarnings = ["error::DeprecationWarning:app.*"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+# `tests/` is not a package; this stops conftest being imported under two names.
+explicit_package_bases = true
+mypy_path = "."
+files = ["app", "tests", "scripts"]
 
 [tool.ruff]
 line-length = 100
